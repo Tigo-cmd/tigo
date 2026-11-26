@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Self-check test suite for Tigo compiler, checker, providers, sandbox, and durable runtime."""
-import os, tempfile, unittest
+import os, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -221,6 +221,47 @@ Repo: ${bad_ref}
             )
             self.assertEqual(val_o, "hello local")
             self.assertEqual(cost_o, 0.0)
+
+    def test_parallel_for_concurrency_ordering_and_replay(self):
+        src = """
+        type ItemOut { idx: int, label: string }
+        agent Worker { model: "m", budget: $0.05, max_steps: 2 }
+        workflow fan_out(items: list<int>) -> list<ItemOut> {
+            let out: list<ItemOut> = parallel for x in items {
+                return ask Worker("item:${x}")
+            }
+            return out
+        }
+        """
+        prog = compile_source(src)
+        calls = []
+
+        def slow_llm(agent_name, history, schema, step):
+            idx = int(history[0]["content"].split(":")[1])
+            calls.append(idx)
+            # Branch 0 sleeps longest (0.06s), branch 2 shortest (0.04s) to test deterministic output order
+            time.sleep(0.06 - idx * 0.01)
+            return {"idx": idx, "label": f"done-{idx}"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(f"{tmp}/state.db")
+            store.start_run("par1", "mem", "fan_out", {"items": [0, 1, 2]})
+            rt1 = Runtime(prog, store, "par1", mock_llm=slow_llm)
+
+            t0 = time.monotonic()
+            res1 = rt1.run_workflow("fan_out", {"items": [0, 1, 2]})
+            elapsed = time.monotonic() - t0
+
+            # Sequential would be 0.06 + 0.05 + 0.04 = 0.15s; parallel should finish well under 0.13s
+            self.assertLess(elapsed, 0.13)
+            self.assertEqual([r["idx"] for r in res1], [0, 1, 2])
+            self.assertEqual(len(calls), 3)
+
+            # Replay must hit SQLite checkpoints with zero extra LLM calls
+            rt2 = Runtime(prog, store, "par1", mock_llm=slow_llm)
+            res2 = rt2.run_workflow("fan_out", {"items": [0, 1, 2]})
+            self.assertEqual(res2, res1)
+            self.assertEqual(len(calls), 3)
 
 
 if __name__ == "__main__":

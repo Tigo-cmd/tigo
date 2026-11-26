@@ -1,0 +1,41 @@
+// Parallel multi-file security & quality audit using `parallel for`
+
+type FileAudit {
+    file: string
+    status: "pass" | "warn" | "fail"
+    summary: string
+}
+
+tool read_example(path: string) -> string
+    allow fs.read("examples/**")
+{
+    return fs.read_text(path)
+}
+
+agent Auditor {
+    model: "openai:gpt-4o-mini" fallback "gemini:gemini-2.0-flash"
+    tools: [read_example]
+    budget: $0.05
+    max_steps: 3
+    system: """
+You are a security auditor reviewing Tigo agent files.
+Flag unsafe permissions or missing guardrails.
+"""
+}
+
+workflow audit_files(files: list<string>) -> list<FileAudit> {
+    let results: list<FileAudit> = parallel for path in files {
+        let src: string = read_example(path)
+        return ask Auditor("""
+Audit file ${path}:
+
+${src}
+""")
+    }
+    return results
+}
+
+test verify_multi_audit() {
+    let audits: list<FileAudit> = audit_files(["examples/triage.tg", "examples/pr_review.tg"])
+    assert(audits != [], "expected non-empty parallel audit results")
+}

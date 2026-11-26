@@ -9,6 +9,7 @@ A minimal language and durable runtime for safe, typed AI agents—focused on **
 - **Compile-Time Verification (`tigo check`)**: Catches undefined `${variables}` inside prompts, missing agent `budget`/`max_steps`, unknown types, and unguarded I/O before spending a single token.
 - **Capability Sandboxing (`allow`)**: File, network, and shell I/O (`fs.read_text`, `fs.write_text`, `http.get`, `sh.run`) are blocked outside `tool` definitions and restricted to explicit glob rules (`allow fs.read("examples/**")`, `allow sh("git diff*")`).
 - **Durable Execution & TTY-Aware Approval (`require approval`)**: Every step is journaled to `.tigo/state.db`. Prompts interactively (`[y/N]`) in a terminal, or pauses durably in CI/`--non-interactive` mode so you can resume via `tigo replay <run_id> --approve` without re-paying for earlier LLM calls.
+- **Concurrent Fan-Out (`parallel for`)**: Run multiple `ask` or tool calls concurrently with deterministic result ordering and thread-safe SQLite checkpoint replay (see [examples/multi_audit.tg](examples/multi_audit.tg)).
 - **Built-in `.tg` Test Runner (`tigo test`) & Multi-file `import`**: Write `test name() { assert(...) }` directly inside `.tg` files.
 
 ## Install & Quick Start

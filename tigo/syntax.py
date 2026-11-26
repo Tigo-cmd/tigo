@@ -280,6 +280,12 @@ class Parser:
             var = self.eat(kind="ID").val
             self.eat("in")
             return ("for", var, self.parse_expr(), self.parse_block(), t.line)
+        if t.val == "parallel":
+            self.eat("parallel")
+            self.eat("for")
+            var = self.eat(kind="ID").val
+            self.eat("in")
+            return ("parfor", var, self.parse_expr(), self.parse_block(), t.line)
         if t.val == "return":
             self.eat("return")
             return ("return", self.parse_expr(), t.line)
@@ -337,6 +343,12 @@ class Parser:
 
     def parse_primary(self) -> tuple:
         t = self.cur()
+        if t.val == "parallel":
+            self.eat("parallel")
+            self.eat("for")
+            var = self.eat(kind="ID").val
+            self.eat("in")
+            return ("parfor", var, self.parse_expr(), self.parse_block(), t.line)
         if t.val == "ask":
             self.eat("ask")
             ag = self.eat(kind="ID").val

@@ -1,5 +1,6 @@
 """Durable SQLite store, capability sandbox, schema validation, and interpreter runtime."""
-import fnmatch, json, re, shlex, sqlite3, subprocess, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+import fnmatch, json, re, shlex, sqlite3, subprocess, sys, threading, time, urllib.request
 from pathlib import Path
 from typing import Any, Callable
 from .providers import DEFAULT_STEP_COST, call_provider
@@ -91,8 +92,9 @@ def type_to_schema_hint(prog: Program, tref: TypeRef | None) -> dict[str, Any]:
 class DurableStore:
     def __init__(self, db_path: str = ".tigo/state.db"):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(db_path)
-        with self.conn:
+        self._lock = threading.Lock()
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        with self._lock, self.conn:
             self.conn.execute(
                 """CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY, file TEXT, workflow TEXT, args_json TEXT,
@@ -108,7 +110,7 @@ class DurableStore:
             )
 
     def start_run(self, run_id: str, file: str, workflow: str, args: dict) -> None:
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute(
                 "INSERT OR IGNORE INTO runs VALUES (?, ?, ?, ?, 'running', 0.0, ?)",
                 (run_id, file, workflow, json.dumps(args), time.time()),
@@ -116,23 +118,25 @@ class DurableStore:
             self.conn.execute("UPDATE runs SET status='running' WHERE run_id=?", (run_id,))
 
     def get_run(self, run_id: str) -> tuple | None:
-        return self.conn.execute(
-            "SELECT run_id, file, workflow, args_json, status, cost_usd FROM runs WHERE run_id=?",
-            (run_id,),
-        ).fetchone()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT run_id, file, workflow, args_json, status, cost_usd FROM runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
 
     def set_status(self, run_id: str, status: str) -> None:
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute("UPDATE runs SET status=? WHERE run_id=?", (status, run_id))
 
     def get_step(self, run_id: str, step_key: str) -> Any | None:
-        row = self.conn.execute(
-            "SELECT result_json FROM steps WHERE run_id=? AND step_key=?", (run_id, step_key)
-        ).fetchone()
-        return json.loads(row[0]) if row else None
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT result_json FROM steps WHERE run_id=? AND step_key=?", (run_id, step_key)
+            ).fetchone()
+            return json.loads(row[0]) if row else None
 
     def save_step(self, run_id: str, step_key: str, kind: str, detail: str, result: Any, cost: float = 0.0) -> None:
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute(
                 "INSERT OR REPLACE INTO steps VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (run_id, step_key, kind, detail, json.dumps(result), cost, time.time()),
@@ -140,10 +144,11 @@ class DurableStore:
             self.conn.execute("UPDATE runs SET cost_usd = cost_usd + ? WHERE run_id=?", (cost, run_id))
 
     def trace(self, run_id: str) -> list[tuple]:
-        return self.conn.execute(
-            "SELECT step_key, kind, detail, result_json, cost_usd FROM steps WHERE run_id=? ORDER BY ts ASC",
-            (run_id,),
-        ).fetchall()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT step_key, kind, detail, result_json, cost_usd FROM steps WHERE run_id=? ORDER BY ts ASC",
+                (run_id,),
+            ).fetchall()
 
 
 class ApprovalPaused(Exception):
@@ -175,6 +180,8 @@ class Runtime:
         interactive: bool = False,
         input_fn: Callable[[str], str] = input,
         mock_llm: Any = None,
+        key_prefix: str = "",
+        expected_return: TypeRef | None = None,
     ):
         self.prog = prog
         self.store = store
@@ -183,12 +190,14 @@ class Runtime:
         self.interactive = interactive
         self.input_fn = input_fn
         self.mock_llm = mock_llm
+        self.key_prefix = key_prefix
+        self.expected_return = expected_return
         self.step_counter = 0
         self.active_allows: list[tuple[str, str]] | None = None
 
     def next_key(self, tag: str) -> str:
         self.step_counter += 1
-        return f"{self.step_counter:03d}:{tag}"
+        return f"{self.key_prefix}{self.step_counter:03d}:{tag}"
 
     def check_cap(self, cap: str, target: str, line: int) -> None:
         if self.active_allows is None:
@@ -233,7 +242,13 @@ class Runtime:
             kind, line = s[0], s[-1]
             if kind == "let":
                 _, name, tref, expr, _ = s
-                val = self.eval_ask(expr[1], expr[2], env, tref, line) if expr[0] == "ask" else self.eval_expr(expr, env)
+                if expr[0] == "ask":
+                    val = self.eval_ask(expr[1], expr[2], env, tref, line)
+                elif expr[0] == "parfor":
+                    elem_t = tref.arg if (tref and tref.base == "list") else None
+                    val = self.exec_parfor(expr[1], expr[2], expr[3], env, elem_t, line)
+                else:
+                    val = self.eval_expr(expr, env)
                 env[name] = validate_type(self.prog, tref, val, name)
             elif kind == "if":
                 _, cond, tb, eb, _ = s
@@ -246,8 +261,17 @@ class Runtime:
                 for item in self.eval_expr(it, env):
                     env[var] = item
                     self.exec_block(body, env)
+            elif kind == "parfor":
+                _, var, it, body, _ = s
+                self.exec_parfor(var, it, body, env, None, line)
             elif kind == "return":
-                raise ReturnSignal(self.eval_expr(s[1], env))
+                expr = s[1]
+                val = (
+                    self.eval_ask(expr[1], expr[2], env, self.expected_return, line)
+                    if expr[0] == "ask" and self.expected_return is not None
+                    else self.eval_expr(expr, env)
+                )
+                raise ReturnSignal(val)
             elif kind == "approve":
                 self._handle_approval(str(self.eval_expr(s[1], env)))
             elif kind == "expr":
@@ -344,9 +368,45 @@ class Runtime:
             if fn in self.prog.workflows:
                 wf = self.prog.workflows[fn]
                 return self.run_workflow(fn, {k: v for (k, _), v in zip(wf.params, args)})
+        if kind == "parfor":
+            return self.exec_parfor(e[1], e[2], e[3], env, None, line)
         if kind == "ask":
             return self.eval_ask(e[1], e[2], env, None, line)
         raise TigoError(f"Line {line}: unsupported expression {kind}")
+
+    def exec_parfor(
+        self, var: str, it_expr: tuple, body: list[tuple], env: dict[str, Any], elem_tref: TypeRef | None, line: int
+    ) -> list[Any]:
+        items = self.eval_expr(it_expr, env)
+        if not isinstance(items, list):
+            raise TigoError(f"Line {line}: parallel for expects a list, got {type(items).__name__}")
+        if not items:
+            return []
+        base_key = self.next_key("par")
+
+        def run_branch(idx: int, item: Any) -> Any:
+            child = Runtime(
+                self.prog,
+                self.store,
+                self.run_id,
+                approved=self.approved,
+                interactive=False,  # avoid interleaved stdin prompts across threads
+                input_fn=self.input_fn,
+                mock_llm=self.mock_llm,
+                key_prefix=f"{base_key}[{idx}]/",
+                expected_return=elem_tref,
+            )
+            branch_env = dict(env)
+            branch_env[var] = item
+            try:
+                child.exec_block(body, branch_env)
+                return None
+            except ReturnSignal as r:
+                return validate_type(self.prog, elem_tref, r.val, f"{base_key}[{idx}]")
+
+        with ThreadPoolExecutor(max_workers=min(len(items), 8)) as pool:
+            futs = [pool.submit(run_branch, i, item) for i, item in enumerate(items)]
+            return [f.result() for f in futs]
 
     def invoke_tool(self, name: str, args: list[Any], line: int) -> Any:
         tool = self.prog.tools[name]

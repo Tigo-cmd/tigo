@@ -65,7 +65,7 @@ def check_stmts(prog: Program, stmts: list[tuple], scope: dict[str, TypeRef], is
             check_expr(prog, cond, scope, is_tool)
             check_stmts(prog, tb, dict(scope), is_tool)
             check_stmts(prog, eb, dict(scope), is_tool)
-        elif kind == "for":
+        elif kind in ("for", "parfor"):
             _, var, it, body, _ = s
             it_t = check_expr(prog, it, scope, is_tool)
             sub = dict(scope)
@@ -136,6 +136,13 @@ def check_expr(prog: Program, e: tuple, scope: dict[str, TypeRef], is_tool: bool
                 raise TigoError(f"Line {line}: workflow {fn!r} expects {len(wdecl.params)} args, got {len(args)}")
             return wdecl.ret
         raise TigoError(f"Line {line}: unknown function or tool {fn!r}")
+    if kind == "parfor":
+        _, var, it, body, _ = e
+        it_t = check_expr(prog, it, scope, is_tool)
+        sub = dict(scope)
+        sub[var] = it_t.arg if it_t.base == "list" else TypeRef("any")
+        check_stmts(prog, body, sub, is_tool)
+        return TypeRef("list", TypeRef("any"))
     if kind == "ask":
         if e[1] not in prog.agents:
             raise TigoError(f"Line {line}: unknown agent {e[1]!r}")

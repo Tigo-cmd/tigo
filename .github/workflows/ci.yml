@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run Python unit tests
+        run: python3 test_tigo.py -v
+      - name: Static check examples
+        run: |
+          python3 -m tigo check examples/triage.tg
+          python3 -m tigo check examples/pr_review.tg
+          python3 -m tigo check examples/multi_audit.tg
+      - name: Run embedded .tg tests
+        run: |
+          python3 -m tigo test examples/triage.tg
+          python3 -m tigo test examples/pr_review.tg
+          python3 -m tigo test examples/multi_audit.tg
