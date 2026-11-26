@@ -143,12 +143,17 @@ Repo: ${bad_ref}
         type Score {
             val: float where val >= 0.0 && val <= 1.0
         }
-        tool run_cmd(cmd: string) -> string allow sh("echo *") {
+        tool run_cmd(cmd: string) -> string allow sh("echo*") {
             return sh.run(cmd)
+        }
+        tool safe_echo(msg: string) -> string allow sh("echo") {
+            return sh.run("echo", [msg])
         }
         agent Scorer { model: "m", budget: $0.02, max_steps: 3 }
         workflow wf(cmd: string) -> Score {
             let out: string = run_cmd(cmd)
+            let q: string = safe_echo("quoted \\"msg\\"")
+            assert(q == "quoted \\"msg\\"", "safe argv preserves quotes")
             let s: Score = ask Scorer("Score: ${out}")
             return s
         }

@@ -361,7 +361,12 @@ class Runtime:
             if target == "sh" and method == "run":
                 cmd_str = str(args[0]).strip()
                 self.check_cap("sh", cmd_str, line)
-                proc = subprocess.run(shlex.split(cmd_str), capture_output=True, text=True, timeout=15, check=False)
+                argv = shlex.split(cmd_str)
+                if len(args) > 1:
+                    if not isinstance(args[1], list):
+                        raise TigoError(f"Line {line}: sh.run second argument must be a list of strings")
+                    argv.extend(str(a) for a in args[1])
+                proc = subprocess.run(argv, capture_output=True, text=True, timeout=15, check=False)
                 return proc.stdout.strip() if proc.returncode == 0 else proc.stderr.strip()
             raise TigoError(f"Line {line}: unknown capability method {target}.{method}")
         if kind == "call":

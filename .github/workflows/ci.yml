@@ -25,8 +25,10 @@ jobs:
           python3 -m tigo check examples/triage.tg
           python3 -m tigo check examples/pr_review.tg
           python3 -m tigo check examples/multi_audit.tg
+          python3 -m tigo check examples/smart_commit.tg
       - name: Run embedded .tg tests
         run: |
           python3 -m tigo test examples/triage.tg
           python3 -m tigo test examples/pr_review.tg
           python3 -m tigo test examples/multi_audit.tg
+          python3 -m tigo test examples/smart_commit.tg

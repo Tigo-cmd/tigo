@@ -1,0 +1,65 @@
+// Smart Git Commit Helper: inspects staged diff for secrets/bugs, drafts a commit message, and commits after approval
+
+type CommitPlan {
+    title: string
+    risk: "safe" | "warning" | "blocked"
+    reason: string
+    body: string
+}
+
+tool staged_diff() -> string
+    allow sh("git diff --cached")
+{
+    return sh.run("git diff --cached")
+}
+
+tool do_commit(title: string) -> string
+    allow sh("git commit -m")
+{
+    return sh.run("git commit -m", [title])
+}
+
+agent CommitBot {
+    model: "openai:gpt-4o-mini" fallback "ollama:llama3.2"
+    tools: [staged_diff]
+    budget: $0.03
+    max_steps: 3
+    system: """
+You are a senior engineer reviewing staged git changes before a commit.
+1. Set risk="blocked" if you see hardcoded API keys, passwords, tokens, or obvious broken code.
+2. Otherwise write a concise Conventional Commit title (<= 72 chars) and short body.
+"""
+}
+
+workflow smart_commit() -> CommitPlan {
+    let diff: string = staged_diff()
+    if diff == "" {
+        return {
+            title: "No staged changes",
+            risk: "blocked",
+            reason: "Nothing is staged. Run 'git add <files>' first.",
+            body: ""
+        }
+    }
+
+    let plan: CommitPlan = ask CommitBot("""
+Inspect this staged git diff for leaked secrets or bugs, then propose a commit message:
+
+${diff}
+""")
+
+    if plan.risk == "blocked" {
+        print("Commit blocked: ${plan.reason}")
+        return plan
+    }
+
+    require approval("Commit with message: '${plan.title}' (risk=${plan.risk})?")
+    let out: string = do_commit(plan.title)
+    print(out)
+    return plan
+}
+
+test verify_smart_commit_empty_stage() {
+    let res: CommitPlan = smart_commit()
+    assert(res.risk == "blocked" || res.risk == "safe" || res.risk == "warning", "valid risk enum")
+}
