@@ -1,0 +1,46 @@
+// DevOps PR Review workflow using sandboxed git diff, multiline prompts, and human approval
+
+type PRReview {
+    decision: "approve" | "comment" | "request_changes"
+    risk_score: float where risk_score >= 0.0 && risk_score <= 1.0
+    summary: string
+    blocking_issues: list<string>
+}
+
+tool git_diff(base_ref: string) -> string
+    allow sh("git diff*")
+{
+    return sh.run("git diff ${base_ref}")
+}
+
+agent Reviewer {
+    model: "anthropic:claude-3-5-sonnet" fallback "openai:gpt-4o-mini"
+    tools: [git_diff]
+    budget: $0.08
+    max_steps: 4
+    system: """
+You are a staff engineer reviewing a pull request.
+Focus on bugs, security issues, and regressions. Ignore formatting nitpicks.
+"""
+}
+
+workflow review_pr(base_ref: string) -> PRReview {
+    let diff: string = git_diff(base_ref)
+    let review: PRReview = ask Reviewer("""
+Review the following git diff against ${base_ref}:
+
+${diff}
+""")
+
+    if review.decision == "request_changes" || review.risk_score >= 0.7 {
+        require approval("High-risk PR (score=${review.risk_score}): ${review.summary}. Post review?")
+    }
+
+    return review
+}
+
+test verify_pr_review() {
+    let res: PRReview = review_pr("HEAD")
+    assert(res.risk_score >= 0.0 && res.risk_score <= 1.0, "risk_score must be in [0, 1]")
+    assert(res.decision == "approve", "expected default offline synth decision")
+}

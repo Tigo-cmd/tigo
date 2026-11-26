@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tigo-lang"
+version = "0.2.0"
+description = "A minimal language and durable runtime for safe, typed AI agents."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+tigo = "tigo.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tigo*"]

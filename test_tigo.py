@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Self-check test suite for Tigo compiler, checker, sandbox, and durable runtime."""
-import tempfile
+"""Self-check test suite for Tigo compiler, checker, providers, sandbox, and durable runtime."""
+import os, tempfile, unittest
 from pathlib import Path
-import unittest
-from tigo import ApprovalPaused, DurableStore, Runtime, TigoError, compile_source
+from unittest import mock
+
+from tigo import ApprovalPaused, ApprovalRejected, DurableStore, Runtime, TigoError, compile_file, compile_source
+from tigo.providers import call_provider
+from tigo.syntax import AgentDecl, TypeRef
 
 
 class TigoTests(unittest.TestCase):
     def test_static_checker_catches_bad_interpolation_and_missing_guardrails(self):
-        # 1. Undefined variable inside prompt interpolation
         with self.assertRaisesRegex(TigoError, "undefined variable 'missing_var'"):
             compile_source("""
             agent Bot { model: "m", budget: $0.01, max_steps: 2 }
@@ -17,19 +19,47 @@ class TigoTests(unittest.TestCase):
             }
             """)
 
-        # 2. Missing budget guardrail on agent
         with self.assertRaisesRegex(TigoError, "missing required guardrail 'budget'"):
             compile_source("""
             agent Bot { model: "m", max_steps: 2 }
             """)
 
-        # 3. Direct fs.read_text inside workflow (must be inside a tool with allow)
         with self.assertRaisesRegex(TigoError, "only allowed inside a tool"):
             compile_source("""
             workflow wf(p: string) -> string {
                 return fs.read_text(p)
             }
             """)
+
+    def test_multiline_triple_quoted_prompt_and_interpolation_check(self):
+        prog = compile_source('''
+        agent Bot {
+            model: "gpt-4o-mini"
+            budget: $0.02
+            max_steps: 2
+            system: """
+You are a DevOps assistant.
+Be concise.
+"""
+        }
+        workflow wf(repo: string) -> string {
+            return ask Bot("""
+Check repository:
+${repo}
+""")
+        }
+        ''')
+        self.assertIn("DevOps assistant.", prog.agents["Bot"].config["system"])
+
+        with self.assertRaisesRegex(TigoError, "undefined variable 'bad_ref'"):
+            compile_source('''
+            agent Bot { model: "m", budget: $0.01, max_steps: 2 }
+            workflow wf(repo: string) -> string {
+                return ask Bot("""
+Repo: ${bad_ref}
+""")
+            }
+            ''')
 
     def test_capability_sandbox_blocks_unauthorized_paths(self):
         src = """
@@ -44,50 +74,56 @@ class TigoTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = DurableStore(f"{tmp}/state.db")
             rt = Runtime(prog, store, "run1")
-            # Allowed path works
             res = rt.run_workflow("wf", {"p": "examples/triage.tg"})
             self.assertIn("TriageBot", res)
-            # Unauthorized path in workspace is blocked
             with self.assertRaisesRegex(TigoError, "sandbox denied fs.read"):
                 rt.run_workflow("wf", {"p": "tigo.py"})
-            # Path traversal outside workspace is blocked
             with self.assertRaisesRegex(TigoError, "sandbox blocked path traversal"):
                 rt.run_workflow("wf", {"p": "../outside.txt"})
 
-    def test_auto_repair_tool_use_and_durable_approval_replay(self):
-        src = Path("examples/triage.tg").read_text(encoding="utf-8")
-        prog = compile_source(src)
-
+    def test_auto_repair_and_durable_approval_replay(self):
+        prog = compile_file("examples/triage.tg")
         calls = []
 
         def fake_llm(agent_name, history, schema, step):
             calls.append(step)
             if step == 1:
-                # Return invalid enum value on step 1 to test auto-repair
                 return {"severity": "INVALID_ENUM", "summary": "bad", "affected_files": [], "confidence": 0.5}
-            # Step 2: valid critical report
-            return {
-                "severity": "critical",
-                "summary": "Null pointer in parser",
-                "affected_files": ["tigo.py"],
-                "confidence": 0.95,
-            }
+            return {"severity": "critical", "summary": "Null pointer", "affected_files": ["tigo.py"], "confidence": 0.95}
 
         with tempfile.TemporaryDirectory() as tmp:
             store = DurableStore(f"{tmp}/state.db")
             store.start_run("run_pause", "examples/triage.tg", "triage_issue", {"issue_text": "crash"})
 
-            # First run: auto-repairs step 1 -> step 2, then pauses on require approval(...)
-            rt1 = Runtime(prog, store, "run_pause", approved=False, mock_llm=fake_llm)
+            rt1 = Runtime(prog, store, "run_pause", approved=False, interactive=False, mock_llm=fake_llm)
             with self.assertRaises(ApprovalPaused):
                 rt1.run_workflow("triage_issue", {"issue_text": "crash"})
-            self.assertEqual(len(calls), 2)  # Step 1 (invalid) + Step 2 (repaired)
+            self.assertEqual(len(calls), 2)
 
-            # Replay with approval: must NOT re-call the LLM (cached in SQLite)
             rt2 = Runtime(prog, store, "run_pause", approved=True, mock_llm=fake_llm)
             out = rt2.run_workflow("triage_issue", {"issue_text": "crash"})
-            self.assertEqual(len(calls), 2)  # Still 2! Zero extra LLM calls on replay
+            self.assertEqual(len(calls), 2)
             self.assertEqual(out["severity"], "critical")
+
+    def test_interactive_tty_approval_accept_and_reject(self):
+        src = """
+        workflow wf() -> string {
+            require approval("Deploy to prod?")
+            return "deployed"
+        }
+        """
+        prog = compile_source(src)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(f"{tmp}/state.db")
+            store.start_run("r_yes", "mem", "wf", {})
+            rt_yes = Runtime(prog, store, "r_yes", interactive=True, input_fn=lambda _: "y")
+            self.assertEqual(rt_yes.run_workflow("wf", {}), "deployed")
+
+            store.start_run("r_no", "mem", "wf", {})
+            rt_no = Runtime(prog, store, "r_no", interactive=True, input_fn=lambda _: "n")
+            with self.assertRaises(ApprovalRejected):
+                rt_no.run_workflow("wf", {})
+            self.assertEqual(store.get_run("r_no")[4], "rejected")
 
     def test_budget_enforcement(self):
         src = """
@@ -101,7 +137,6 @@ class TigoTests(unittest.TestCase):
         prog = compile_source(src)
         with tempfile.TemporaryDirectory() as tmp:
             store = DurableStore(f"{tmp}/state.db")
-            # Always return invalid schema so it keeps retrying until budget ($0.003 < 2 * $0.002) is exceeded
             rt = Runtime(prog, store, "run_budget", mock_llm=lambda *_: {"ok": "not_a_bool"})
             with self.assertRaisesRegex(TigoError, "exceeded budget"):
                 rt.run_workflow("wf", {})
@@ -111,12 +146,12 @@ class TigoTests(unittest.TestCase):
         type Score {
             val: float where val >= 0.0 && val <= 1.0
         }
-        tool git_check(cmd: string) -> string allow sh("echo *") {
+        tool run_cmd(cmd: string) -> string allow sh("echo *") {
             return sh.run(cmd)
         }
         agent Scorer { model: "m", budget: $0.02, max_steps: 3 }
         workflow wf(cmd: string) -> Score {
-            let out: string = git_check(cmd)
+            let out: string = run_cmd(cmd)
             let s: Score = ask Scorer("Score: ${out}")
             return s
         }
@@ -124,7 +159,6 @@ class TigoTests(unittest.TestCase):
         prog = compile_source(src)
         with tempfile.TemporaryDirectory() as tmp:
             store = DurableStore(f"{tmp}/state.db")
-            # Step 1 violates 'where' (1.5 > 1.0), Step 2 succeeds (0.8)
             rt = Runtime(
                 prog,
                 store,
@@ -133,10 +167,60 @@ class TigoTests(unittest.TestCase):
             )
             res = rt.run_workflow("wf", {"cmd": "echo hello"})
             self.assertEqual(res["val"], 0.8)
-
-            # Unauthorized shell command is blocked
             with self.assertRaisesRegex(TigoError, "sandbox denied sh"):
                 rt.run_workflow("wf", {"cmd": "rm -rf /"})
+
+    def test_multi_provider_routing_cost_and_fallback(self):
+        env_keys = {
+            "OPENAI_API_KEY": "sk-test",
+            "ANTHROPIC_API_KEY": "ant-test",
+            "GEMINI_API_KEY": "gem-test",
+        }
+        with mock.patch.dict(os.environ, env_keys, clear=False):
+            # 1. Anthropic primary fails -> OpenAI fallback succeeds with exact token cost
+            seen_urls = []
+
+            def fake_post(url, payload, headers):
+                seen_urls.append(url)
+                if "anthropic.com" in url:
+                    raise RuntimeError("503 overloaded")
+                return {
+                    "choices": [{"message": {"content": '```json\n{"ok": true}\n```'}}],
+                    "usage": {"prompt_tokens": 1000, "completion_tokens": 500},
+                }
+
+            ag = AgentDecl("A", {"model": "anthropic:claude-3-5-sonnet", "fallback": "openai:gpt-4o-mini"}, 1)
+            val, cost = call_provider(ag, [{"role": "user", "content": "hi"}], {"type": "object"}, TypeRef("Out"), post_fn=fake_post)
+            self.assertEqual(val, {"ok": True})
+            self.assertEqual(len(seen_urls), 2)
+            self.assertAlmostEqual(cost, 0.00045, places=6)
+
+            # 2. Gemini response parsing + token cost
+            ag_gem = AgentDecl("G", {"model": "gemini-2.0-flash"}, 1)
+            val_g, cost_g = call_provider(
+                ag_gem,
+                [{"role": "user", "content": "hi"}],
+                {"type": "string"},
+                TypeRef("string"),
+                post_fn=lambda u, p, h: {
+                    "candidates": [{"content": {"parts": [{"text": "hello gemini"}]}}],
+                    "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 1000},
+                },
+            )
+            self.assertEqual(val_g, "hello gemini")
+            self.assertAlmostEqual(cost_g, 0.0005, places=6)
+
+            # 3. Ollama local model ($0 cost)
+            ag_ol = AgentDecl("O", {"model": "ollama:llama3.2"}, 1)
+            val_o, cost_o = call_provider(
+                ag_ol,
+                [{"role": "user", "content": "hi"}],
+                {"type": "string"},
+                TypeRef("string"),
+                post_fn=lambda u, p, h: {"message": {"content": "hello local"}},
+            )
+            self.assertEqual(val_o, "hello local")
+            self.assertEqual(cost_o, 0.0)
 
 
 if __name__ == "__main__":
