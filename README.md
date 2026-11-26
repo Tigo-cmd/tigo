@@ -34,6 +34,12 @@ python3 -m tigo trace <run_id>
 # Resume a paused non-interactive run after approval
 python3 -m tigo replay <run_id> --approve
 
+# Start interactive REPL
+python3 -m tigo repl
+
 # Run Python unit test suite
 python3 test_tigo.py -v
 ```
+
+## Editor Support
+VS Code syntax highlighting for `.tg` files is included in `editors/vscode/`.

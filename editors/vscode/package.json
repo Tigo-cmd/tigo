@@ -1,0 +1,24 @@
+{
+  "name": "tigo-lang",
+  "displayName": "Tigo (.tg)",
+  "description": "Syntax highlighting for the Tigo (.tg) AI agent programming language.",
+  "version": "0.2.0",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "tigo",
+        "aliases": ["Tigo", "tigo"],
+        "extensions": [".tg"]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "tigo",
+        "scopeName": "source.tigo",
+        "path": "./syntaxes/tigo.tmLanguage.json"
+      }
+    ]
+  }
+}

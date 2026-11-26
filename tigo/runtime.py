@@ -150,6 +150,16 @@ class DurableStore:
                 (run_id,),
             ).fetchall()
 
+    def close(self) -> None:
+        with self._lock:
+            self.conn.close()
+
+    def __enter__(self) -> "DurableStore":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
 
 class ApprovalPaused(Exception):
     def __init__(self, run_id: str, message: str):

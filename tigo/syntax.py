@@ -29,6 +29,21 @@ class TigoError(Exception):
     pass
 
 
+def format_error(err: Exception, src: str, filename: str = "<input>") -> str:
+    msg = str(err)
+    m = re.match(r"Line (\d+):\s*(.*)", msg)
+    if not m:
+        return f"TigoError ({filename}): {msg}"
+    line_no, detail = int(m.group(1)), m.group(2)
+    lines = src.splitlines()
+    if 1 <= line_no <= len(lines):
+        code_line = lines[line_no - 1]
+        indent = len(code_line) - len(code_line.lstrip(" "))
+        pointer = " " * indent + "^" * max(1, len(code_line.strip()))
+        return f"{filename}:{line_no}: TigoError: {detail}\n  {line_no:4d} | {code_line}\n       | {pointer}"
+    return f"{filename}:{line_no}: TigoError: {detail}"
+
+
 def decode_str(tok: Tok) -> str:
     if tok.kind == "MSTR":
         body = tok.val[3:-3]

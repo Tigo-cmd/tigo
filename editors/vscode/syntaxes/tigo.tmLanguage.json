@@ -1,0 +1,36 @@
+{
+  "name": "Tigo",
+  "scopeName": "source.tigo",
+  "patterns": [
+    { "name": "comment.line.double-slash.tigo", "match": "//.*$" },
+    {
+      "name": "string.quoted.triple.tigo",
+      "begin": "\"\"\"",
+      "end": "\"\"\"",
+      "patterns": [
+        { "name": "variable.other.interpolation.tigo", "match": "\\$\\{[^}]+\\}" }
+      ]
+    },
+    {
+      "name": "string.quoted.double.tigo",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.tigo", "match": "\\\\." },
+        { "name": "variable.other.interpolation.tigo", "match": "\\$\\{[^}]+\\}" }
+      ]
+    },
+    {
+      "name": "keyword.control.tigo",
+      "match": "\\b(import|type|tool|agent|workflow|fn|test|let|if|else|for|parallel|in|return|ask|allow|where|fallback|require|approval)\\b"
+    },
+    {
+      "name": "support.type.primitive.tigo",
+      "match": "\\b(string|int|float|bool|list|void|any)\\b"
+    },
+    { "name": "constant.numeric.currency.tigo", "match": "\\$\\d+(?:\\.\\d+)?" },
+    { "name": "constant.numeric.tigo", "match": "\\b\\d+(?:\\.\\d+)?\\b" },
+    { "name": "constant.language.boolean.tigo", "match": "\\b(true|false)\\b" },
+    { "name": "support.function.builtin.tigo", "match": "\\b(fs|http|sh|print|assert)\\b" }
+  ]
+}

@@ -5,8 +5,9 @@ from pathlib import Path
 from unittest import mock
 
 from tigo import ApprovalPaused, ApprovalRejected, DurableStore, Runtime, TigoError, compile_file, compile_source
+from tigo.cli import run_repl
 from tigo.providers import call_provider
-from tigo.syntax import AgentDecl, TypeRef
+from tigo.syntax import AgentDecl, TypeRef, format_error
 
 
 class TigoTests(unittest.TestCase):
@@ -71,8 +72,7 @@ Repo: ${bad_ref}
         }
         """
         prog = compile_source(src)
-        with tempfile.TemporaryDirectory() as tmp:
-            store = DurableStore(f"{tmp}/state.db")
+        with tempfile.TemporaryDirectory() as tmp, DurableStore(f"{tmp}/state.db") as store:
             rt = Runtime(prog, store, "run1")
             res = rt.run_workflow("wf", {"p": "examples/triage.tg"})
             self.assertIn("TriageBot", res)
@@ -91,8 +91,7 @@ Repo: ${bad_ref}
                 return {"severity": "INVALID_ENUM", "summary": "bad", "affected_files": [], "confidence": 0.5}
             return {"severity": "critical", "summary": "Null pointer", "affected_files": ["tigo.py"], "confidence": 0.95}
 
-        with tempfile.TemporaryDirectory() as tmp:
-            store = DurableStore(f"{tmp}/state.db")
+        with tempfile.TemporaryDirectory() as tmp, DurableStore(f"{tmp}/state.db") as store:
             store.start_run("run_pause", "examples/triage.tg", "triage_issue", {"issue_text": "crash"})
 
             rt1 = Runtime(prog, store, "run_pause", approved=False, interactive=False, mock_llm=fake_llm)
@@ -113,8 +112,7 @@ Repo: ${bad_ref}
         }
         """
         prog = compile_source(src)
-        with tempfile.TemporaryDirectory() as tmp:
-            store = DurableStore(f"{tmp}/state.db")
+        with tempfile.TemporaryDirectory() as tmp, DurableStore(f"{tmp}/state.db") as store:
             store.start_run("r_yes", "mem", "wf", {})
             rt_yes = Runtime(prog, store, "r_yes", interactive=True, input_fn=lambda _: "y")
             self.assertEqual(rt_yes.run_workflow("wf", {}), "deployed")
@@ -135,8 +133,7 @@ Repo: ${bad_ref}
         }
         """
         prog = compile_source(src)
-        with tempfile.TemporaryDirectory() as tmp:
-            store = DurableStore(f"{tmp}/state.db")
+        with tempfile.TemporaryDirectory() as tmp, DurableStore(f"{tmp}/state.db") as store:
             rt = Runtime(prog, store, "run_budget", mock_llm=lambda *_: {"ok": "not_a_bool"})
             with self.assertRaisesRegex(TigoError, "exceeded budget"):
                 rt.run_workflow("wf", {})
@@ -157,8 +154,7 @@ Repo: ${bad_ref}
         }
         """
         prog = compile_source(src)
-        with tempfile.TemporaryDirectory() as tmp:
-            store = DurableStore(f"{tmp}/state.db")
+        with tempfile.TemporaryDirectory() as tmp, DurableStore(f"{tmp}/state.db") as store:
             rt = Runtime(
                 prog,
                 store,
@@ -243,8 +239,7 @@ Repo: ${bad_ref}
             time.sleep(0.06 - idx * 0.01)
             return {"idx": idx, "label": f"done-{idx}"}
 
-        with tempfile.TemporaryDirectory() as tmp:
-            store = DurableStore(f"{tmp}/state.db")
+        with tempfile.TemporaryDirectory() as tmp, DurableStore(f"{tmp}/state.db") as store:
             store.start_run("par1", "mem", "fan_out", {"items": [0, 1, 2]})
             rt1 = Runtime(prog, store, "par1", mock_llm=slow_llm)
 
@@ -262,6 +257,37 @@ Repo: ${bad_ref}
             res2 = rt2.run_workflow("fan_out", {"items": [0, 1, 2]})
             self.assertEqual(res2, res1)
             self.assertEqual(len(calls), 3)
+
+    def test_error_diagnostics_and_repl(self):
+        src = 'workflow f() -> string {\n    return "hi ${nope}"\n}'
+        try:
+            compile_source(src)
+            self.fail("Expected TigoError")
+        except TigoError as err:
+            formatted = format_error(err, src, "demo.tg")
+            self.assertIn("demo.tg:2: TigoError:", formatted)
+            self.assertIn('return "hi ${nope}"', formatted)
+            self.assertIn("^^^", formatted)
+
+        lines = iter([
+            'let x = 2 + 3',
+            'x * 10',
+            'agent Bot { model: "m", budget: $0.05, max_steps: 2 }',
+            'ask Bot("ping")',
+            'quit',
+        ])
+        outputs = []
+        with tempfile.TemporaryDirectory() as tmp, DurableStore(f"{tmp}/state.db") as store:
+            rc = run_repl(
+                store,
+                input_fn=lambda _: next(lines),
+                output_fn=outputs.append,
+                mock_llm=lambda *_: "pong",
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("50", outputs)
+        self.assertIn("ok", outputs)
+        self.assertIn("pong", outputs)
 
 
 if __name__ == "__main__":
