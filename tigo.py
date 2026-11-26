@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tigo (.tg): Minimal language & durable runtime for safe, typed AI agents."""
-import fnmatch, hashlib, json, os, re, sqlite3, sys, time, urllib.request
+import fnmatch, hashlib, json, os, re, shlex, sqlite3, subprocess, sys, time, urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -57,6 +57,7 @@ class TypeRef:
 class TypeDecl:
     name: str
     fields: dict[str, TypeRef]
+    constraints: dict[str, tuple]
     line: int
 
 
@@ -88,10 +89,12 @@ class WorkflowDecl:
 
 @dataclass
 class Program:
+    imports: list[str] = field(default_factory=list)
     types: dict[str, TypeDecl] = field(default_factory=dict)
     tools: dict[str, ToolDecl] = field(default_factory=dict)
     agents: dict[str, AgentDecl] = field(default_factory=dict)
     workflows: dict[str, WorkflowDecl] = field(default_factory=dict)
+    tests: dict[str, WorkflowDecl] = field(default_factory=dict)
 
 
 # --- 2. Recursive-Descent Parser ---
@@ -122,7 +125,10 @@ class Parser:
         prog = Program()
         while self.cur().kind != "EOF":
             t = self.cur()
-            if t.val == "type":
+            if t.val == "import":
+                self.eat("import")
+                prog.imports.append(json.loads(self.eat(kind="STR").val))
+            elif t.val == "type":
                 d = self.parse_type_decl()
                 prog.types[d.name] = d
             elif t.val == "tool":
@@ -134,6 +140,9 @@ class Parser:
             elif t.val in ("workflow", "fn"):
                 d = self.parse_workflow_decl()
                 prog.workflows[d.name] = d
+            elif t.val == "test":
+                d = self.parse_workflow_decl()
+                prog.tests[d.name] = d
             else:
                 raise TigoError(f"Line {t.line}: unexpected top-level token {t.val!r}")
         return prog
@@ -156,13 +165,15 @@ class Parser:
         line = self.eat("type").line
         name = self.eat(kind="ID").val
         self.eat("{")
-        fields = {}
+        fields, constraints = {}, {}
         while not self.match("}"):
             fname = self.eat(kind="ID").val
             self.eat(":")
             fields[fname] = self.parse_type_ref()
+            if self.match("where"):
+                constraints[fname] = self.parse_expr()
             self.match(",")
-        return TypeDecl(name, fields, line)
+        return TypeDecl(name, fields, constraints, line)
 
     def parse_params(self) -> list[tuple[str, TypeRef]]:
         self.eat("(")
@@ -397,8 +408,10 @@ def check_program(prog: Program) -> None:
             raise TigoError(f"Line {line}: unknown type {tr.base!r}")
 
     for td in prog.types.values():
-        for ft in td.fields.values():
+        for fn, ft in td.fields.items():
             check_type_exists(ft, td.line)
+            if fn in td.constraints:
+                check_expr(prog, td.constraints[fn], {fn: ft}, is_tool=False)
 
     for tool in prog.tools.values():
         for _, pt in tool.params:
@@ -424,7 +437,7 @@ def check_program(prog: Program) -> None:
             if tname not in prog.tools:
                 raise TigoError(f"Line {ag.line}: agent {ag.name!r} references unknown tool {tname!r}")
 
-    for wf in prog.workflows.values():
+    for wf in list(prog.workflows.values()) + list(prog.tests.values()):
         for _, pt in wf.params:
             check_type_exists(pt, wf.line)
         check_type_exists(wf.ret, wf.line)
@@ -472,7 +485,7 @@ def check_expr(prog: Program, e: tuple, scope: dict[str, TypeRef], is_tool: bool
                 raise TigoError(f"Line {line}: prompt/string interpolation references undefined variable {root!r}")
         return TypeRef("string")
     if kind == "var":
-        if e[1] in ("fs", "http"):
+        if e[1] in ("fs", "http", "sh"):
             return TypeRef(e[1])
         if e[1] not in scope:
             raise TigoError(f"Line {line}: undefined variable {e[1]!r}")
@@ -502,14 +515,14 @@ def check_expr(prog: Program, e: tuple, scope: dict[str, TypeRef], is_tool: bool
         obj_t = check_expr(prog, e[1], scope, is_tool)
         for a in e[3]:
             check_expr(prog, a, scope, is_tool)
-        if obj_t.base in ("fs", "http") and not is_tool:
+        if obj_t.base in ("fs", "http", "sh") and not is_tool:
             raise TigoError(f"Line {line}: capability call '{obj_t.base}.{e[2]}' is only allowed inside a tool")
         return TypeRef("string")
     if kind == "call":
         fn, args = e[1], e[2]
         for a in args:
             check_expr(prog, a, scope, is_tool)
-        if fn == "print":
+        if fn in ("print", "assert"):
             return TypeRef("void")
         if fn in prog.tools:
             tdecl = prog.tools[fn]
@@ -569,8 +582,34 @@ def validate_type(prog: Program, tref: TypeRef | None, val: Any, path: str = "ro
             if k not in val:
                 raise ValueError(f"{path}: missing required field {k!r} for {tref.base}")
             out[k] = validate_type(prog, ft, val[k], f"{path}.{k}")
+            if k in td.constraints:
+                if not eval_pure_expr(td.constraints[k], {k: out[k]}):
+                    raise ValueError(f"{path}.{k}: value {out[k]!r} failed 'where' constraint")
         return out
     return val
+
+
+def eval_pure_expr(e: tuple, env: dict[str, Any]) -> Any:
+    kind = e[0]
+    if kind == "lit":
+        return e[1]
+    if kind == "var":
+        return env[e[1]]
+    if kind == "binop":
+        op, l, r = e[1], eval_pure_expr(e[2], env), eval_pure_expr(e[3], env)
+        if op == "+": return l + r
+        if op == "-": return l - r
+        if op == "*": return l * r
+        if op == "/": return l / r
+        if op == "==": return l == r
+        if op == "!=": return l != r
+        if op == "<": return l < r
+        if op == "<=": return l <= r
+        if op == ">": return l > r
+        if op == ">=": return l >= r
+        if op == "&&": return bool(l and r)
+        if op == "||": return bool(l or r)
+    raise ValueError(f"Unsupported expression in where constraint: {kind}")
 
 
 def type_to_schema_hint(prog: Program, tref: TypeRef | None) -> dict[str, Any]:
@@ -771,7 +810,7 @@ class Runtime:
                 return str(v)
             return INTERP_RE.sub(repl, e[1])
         if kind == "var":
-            return e[1] if e[1] in ("fs", "http") else env[e[1]]
+            return e[1] if e[1] in ("fs", "http", "sh") else env[e[1]]
         if kind == "list":
             return [self.eval_expr(x, env) for x in e[1]]
         if kind == "dict":
@@ -812,12 +851,22 @@ class Runtime:
                 self.check_cap("net", host, line)
                 with urllib.request.urlopen(args[0], timeout=10) as resp:
                     return resp.read().decode("utf-8")
+            if target == "sh" and method == "run":
+                cmd_str = str(args[0]).strip()
+                self.check_cap("sh", cmd_str, line)
+                proc = subprocess.run(shlex.split(cmd_str), capture_output=True, text=True, timeout=15, check=False)
+                return proc.stdout.strip() if proc.returncode == 0 else proc.stderr.strip()
             raise TigoError(f"Line {line}: unknown capability method {target}.{method}")
         if kind == "call":
             fn = e[1]
             args = [self.eval_expr(a, env) for a in e[2]]
             if fn == "print":
                 print(*args)
+                return None
+            if fn == "assert":
+                if not args or not args[0]:
+                    msg = args[1] if len(args) > 1 else "assertion failed"
+                    raise TigoError(f"Line {line}: AssertError: {msg}")
                 return None
             if fn in self.prog.tools:
                 return self.invoke_tool(fn, args, line)
@@ -903,18 +952,30 @@ class Runtime:
         sys_msg = ag.config.get("system", "You are a helpful AI agent.")
         if expected and expected.base != "string":
             sys_msg += f"\nRespond ONLY with JSON matching this schema: {json.dumps(schema)}"
-        payload = {
-            "model": ag.config["model"],
-            "messages": [{"role": "system", "content": sys_msg}] + history,
-            "temperature": 0,
-        }
-        req = urllib.request.Request(
-            api_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        models = [ag.config["model"]]
+        if "fallback" in ag.config:
+            models.append(ag.config["fallback"])
+        last_err = None
+        data = None
+        for m in models:
+            payload = {
+                "model": m,
+                "messages": [{"role": "system", "content": sys_msg}] + history,
+                "temperature": 0,
+            }
+            req = urllib.request.Request(
+                api_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                break
+            except Exception as err:
+                last_err = err
+        if data is None:
+            raise TigoError(f"LLM request failed across models {models}: {last_err}")
         text = data["choices"][0]["message"]["content"].strip()
         if text.startswith("```"):
             text = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text).strip()
@@ -946,16 +1007,35 @@ class Runtime:
 
 # --- 6. Public Entry Points & CLI ---
 
-def compile_source(src: str) -> Program:
+def compile_source(src: str, base_dir: Path | None = None, seen: set[Path] | None = None) -> Program:
     prog = Parser(lex(src)).parse()
+    base = base_dir or Path.cwd()
+    visited = seen if seen is not None else set()
+    for imp in prog.imports:
+        imp_path = (base / imp).resolve()
+        if imp_path in visited:
+            continue
+        visited.add(imp_path)
+        if not imp_path.exists():
+            raise TigoError(f"Imported file not found: {imp!r}")
+        sub = compile_source(imp_path.read_text(encoding="utf-8"), imp_path.parent, visited)
+        prog.types = {**sub.types, **prog.types}
+        prog.tools = {**sub.tools, **prog.tools}
+        prog.agents = {**sub.agents, **prog.agents}
+        prog.workflows = {**sub.workflows, **prog.workflows}
     check_program(prog)
     return prog
+
+
+def compile_file(path: str | Path) -> Program:
+    p = Path(path).resolve()
+    return compile_source(p.read_text(encoding="utf-8"), p.parent, {p})
 
 
 def main(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
-        print("Usage:\n  tigo.py check <file.tg>\n  tigo.py run <file.tg> [workflow] [key=val ...] [--approve]\n  tigo.py replay <run_id> [--approve]\n  tigo.py trace <run_id>")
+        print("Usage:\n  tigo.py check <file.tg>\n  tigo.py test <file.tg>\n  tigo.py run <file.tg> [workflow] [key=val ...] [--approve]\n  tigo.py replay <run_id> [--approve]\n  tigo.py trace <run_id>")
         return 0
 
     cmd = args[0]
@@ -964,13 +1044,26 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if cmd == "check":
             path = args[1]
-            prog = compile_source(Path(path).read_text(encoding="utf-8"))
-            print(f"OK: {path} ({len(prog.types)} types, {len(prog.tools)} tools, {len(prog.agents)} agents, {len(prog.workflows)} workflows)")
+            prog = compile_file(path)
+            print(f"OK: {path} ({len(prog.types)} types, {len(prog.tools)} tools, {len(prog.agents)} agents, {len(prog.workflows)} workflows, {len(prog.tests)} tests)")
+            return 0
+
+        if cmd == "test":
+            path = args[1]
+            prog = compile_file(path)
+            for tname, tdecl in prog.tests.items():
+                run_id = f"test_{tname}_{int(time.time()*1000)}"
+                store.start_run(run_id, path, tname, {})
+                rt = Runtime(prog, store, run_id, approved=True)
+                rt.exec_block(tdecl.body, {})
+                store.set_status(run_id, "completed")
+                print(f"PASS: {tname}")
+            print(f"All {len(prog.tests)} test(s) in {path} passed.")
             return 0
 
         if cmd == "run":
             path = args[1]
-            prog = compile_source(Path(path).read_text(encoding="utf-8"))
+            prog = compile_file(path)
             rest = [a for a in args[2:] if a != "--approve"]
             approved = "--approve" in args[2:]
             wf_name = rest[0] if rest and "=" not in rest[0] else next(iter(prog.workflows))

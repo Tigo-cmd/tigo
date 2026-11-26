@@ -4,10 +4,11 @@ A minimal language and durable runtime for safe, typed AI agents. Zero external 
 
 ## Features
 
-- **Typed Prompts (`type` + `ask`)**: LLM outputs are automatically constrained to your declared schema and self-repaired on validation failure.
+- **Typed Prompts & Refinement Constraints (`type`, `where`, `ask`)**: LLM outputs are automatically constrained to your declared schema (including field-level `where` expressions like `confidence: float where confidence >= 0.0 && confidence <= 1.0`) and self-repaired on validation failure.
 - **Compile-Time Verification (`tigo.py check`)**: Catches undefined `${variables}` inside prompt strings, missing agent budgets/step limits, unknown types, and unguarded I/O before spending a single token.
-- **Capability Sandboxing (`allow`)**: File and network I/O is blocked outside `tool` definitions and restricted to explicit glob rules (`allow fs.read("examples/**")`, `allow net("api.github.com")`).
+- **Capability Sandboxing (`allow`)**: File, network, and shell I/O (`fs.read_text`, `fs.write_text`, `http.get`, `sh.run`) is blocked outside `tool` definitions and restricted to explicit glob rules (`allow fs.read("examples/**")`, `allow sh("echo *")`).
 - **Durable Execution & Human Approval (`require approval`)**: Every tool and LLM step is journaled to `.tigo/state.db`. Runs can pause for human approval and resume via `tigo.py replay <run_id> --approve` without re-paying for completed LLM calls.
+- **Built-in `.tg` Test Runner (`tigo.py test`) & Multi-file `import`**: Write `test name() { assert(...) }` blocks directly in `.tg` files and share declarations across files via `import "other.tg"`.
 
 ## Example (`examples/triage.tg`)
 

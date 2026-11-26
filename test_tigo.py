@@ -106,6 +106,38 @@ class TigoTests(unittest.TestCase):
             with self.assertRaisesRegex(TigoError, "exceeded budget"):
                 rt.run_workflow("wf", {})
 
+    def test_where_constraint_auto_repair_and_shell_sandbox(self):
+        src = """
+        type Score {
+            val: float where val >= 0.0 && val <= 1.0
+        }
+        tool git_check(cmd: string) -> string allow sh("echo *") {
+            return sh.run(cmd)
+        }
+        agent Scorer { model: "m", budget: $0.02, max_steps: 3 }
+        workflow wf(cmd: string) -> Score {
+            let out: string = git_check(cmd)
+            let s: Score = ask Scorer("Score: ${out}")
+            return s
+        }
+        """
+        prog = compile_source(src)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(f"{tmp}/state.db")
+            # Step 1 violates 'where' (1.5 > 1.0), Step 2 succeeds (0.8)
+            rt = Runtime(
+                prog,
+                store,
+                "run_where",
+                mock_llm=lambda _a, _h, _s, step: {"val": 1.5 if step == 1 else 0.8},
+            )
+            res = rt.run_workflow("wf", {"cmd": "echo hello"})
+            self.assertEqual(res["val"], 0.8)
+
+            # Unauthorized shell command is blocked
+            with self.assertRaisesRegex(TigoError, "sandbox denied sh"):
+                rt.run_workflow("wf", {"cmd": "rm -rf /"})
+
 
 if __name__ == "__main__":
     unittest.main()

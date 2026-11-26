@@ -4,7 +4,7 @@ type BugReport {
     severity: "low" | "medium" | "critical"
     summary: string
     affected_files: list<string>
-    confidence: float
+    confidence: float where confidence >= 0.0 && confidence <= 1.0
 }
 
 tool read_source(path: string) -> string
@@ -30,4 +30,10 @@ workflow triage_issue(issue_text: string) -> BugReport {
     }
 
     return report
+}
+
+test verify_triage() {
+    let res: BugReport = triage_issue("Crash on empty config")
+    assert(res.confidence >= 0.0 && res.confidence <= 1.0, "confidence must be in [0, 1]")
+    assert(res.severity == "low", "expected default offline synth severity")
 }
