@@ -1,0 +1,33 @@
+// Example Tigo program: Automated Bug Triage with Capability Sandboxing & Human Approval
+
+type BugReport {
+    severity: "low" | "medium" | "critical"
+    summary: string
+    affected_files: list<string>
+    confidence: float
+}
+
+tool read_source(path: string) -> string
+    allow fs.read("examples/**")
+{
+    return fs.read_text(path)
+}
+
+agent TriageBot {
+    model: "gpt-4o-mini" fallback "gpt-4o"
+    tools: [read_source]
+    budget: $0.05
+    max_steps: 5
+    system: "You are a senior engineer triaging incoming bug reports."
+}
+
+workflow triage_issue(issue_text: string) -> BugReport {
+    let snippet: string = read_source("examples/triage.tg")
+    let report: BugReport = ask TriageBot("Analyze issue: ${issue_text} using context: ${snippet}")
+
+    if report.severity == "critical" {
+        require approval("Critical bug detected (${report.summary}). Page on-call engineer?")
+    }
+
+    return report
+}

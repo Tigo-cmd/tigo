@@ -1,0 +1,4 @@
+.tigo/
+__pycache__/
+*.pyc
+.env
